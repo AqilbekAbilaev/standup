@@ -21,6 +21,8 @@ enum Prefs {
 
 enum Stat: String {
     case work       // seconds active at the computer (not on a break, not idle)
+    case rest       // seconds on a break
+    case idle       // seconds away from the keyboard outside of breaks
     case breaks     // breaks completed
     case skips      // breaks skipped with the emergency button
     case postpones  // "Postpone 5 minutes" clicks
@@ -90,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var breakEnds = Date()
     private var pausedUntil: Date?
     private var warned = false
+    private var wasIdle = false
 
     private var statusItem: NSStatusItem!
     private let overlay = BreakOverlay()
@@ -156,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func tick() {
-        if state != .onBreak && systemIdleSeconds() < idleThreshold { Stats.add(.work) }
+        recordTime()
         statsWindow.refresh()
 
         switch state {
@@ -185,6 +188,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let until = pausedUntil, until <= Date() { startWork() }
         }
         updateTitle()
+    }
+
+    /// Adds this second to today's worked, rest or idle total.
+    private func recordTime() {
+        if state == .onBreak {
+            Stats.add(.rest)
+            return
+        }
+        let idle = systemIdleSeconds() >= idleThreshold
+        if idle && !wasIdle {
+            // The threshold's worth of seconds before idle was noticed were counted as work.
+            Stats.add(.work, -Int(idleThreshold))
+            Stats.add(.idle, Int(idleThreshold))
+        }
+        wasIdle = idle
+        Stats.add(idle ? .idle : .work)
     }
 
     private func updateTitle() {
@@ -218,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(disabled(header))
-        menu.addItem(disabled("Active today: \(formatDuration(Stats.get(.work)))"))
+        menu.addItem(disabled("Worked today: \(formatDuration(Stats.get(.work)))"))
         menu.addItem(disabled("Breaks taken today: \(Stats.get(.breaks))"))
         menu.addItem(item("Statistics…") { [weak self] in self?.statsWindow.show() })
         menu.addItem(.separator())
@@ -613,7 +632,7 @@ final class StatsWindow {
 
     func show() {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 440),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable],
                              backing: .buffered, defer: false)
             w.title = "StandUp Statistics"
@@ -636,36 +655,59 @@ final class StatsWindow {
 final class StatsView: NSView {
     override var isFlipped: Bool { true }
 
+    private let timeStats: [(Stat, String, NSColor)] = [
+        (.work, "Worked", .controlAccentColor),
+        (.rest, "Rest", .systemGreen),
+        (.idle, "Idle", .systemGray),
+    ]
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.windowBackgroundColor.setFill()
         bounds.fill()
-        let pad: CGFloat = 24
+        let pad: CGFloat = 24, gap: CGFloat = 12, tileH: CGFloat = 84
 
-        // Today's tiles
+        // Today's tiles: time split on the first row, counts on the second
         text("Today", x: pad, y: pad, size: 13, weight: .semibold, color: .secondaryLabelColor)
-        let tiles: [(String, String)] = [
-            (formatDuration(Stats.get(.work)), "Active time"),
-            ("\(Stats.get(.breaks))", "Breaks taken"),
-            ("\(Stats.get(.skips))", "Breaks skipped"),
-            ("\(Stats.get(.postpones))", "Postponed"),
+        let rows: [[(String, String, NSColor?)]] = [
+            timeStats.map { (formatDuration(Stats.get($0.0)), $0.1, $0.2) },
+            [("\(Stats.get(.breaks))", "Breaks taken", nil),
+             ("\(Stats.get(.skips))", "Breaks skipped", nil),
+             ("\(Stats.get(.postpones))", "Postponed", nil)],
         ]
-        let gap: CGFloat = 12
-        let tileW = (bounds.width - pad * 2 - gap * CGFloat(tiles.count - 1)) / CGFloat(tiles.count)
-        for (i, (value, label)) in tiles.enumerated() {
-            let r = NSRect(x: pad + CGFloat(i) * (tileW + gap), y: pad + 24, width: tileW, height: 84)
-            NSColor.labelColor.withAlphaComponent(0.06).setFill()
-            NSBezierPath(roundedRect: r, xRadius: 10, yRadius: 10).fill()
-            text(value, x: r.minX + 14, y: r.minY + 12, size: 28, weight: .semibold, color: .labelColor)
-            text(label, x: r.minX + 14, y: r.minY + 54, size: 12, color: .secondaryLabelColor)
+        for (row, tiles) in rows.enumerated() {
+            let tileW = (bounds.width - pad * 2 - gap * CGFloat(tiles.count - 1)) / CGFloat(tiles.count)
+            for (i, (value, label, color)) in tiles.enumerated() {
+                let r = NSRect(x: pad + CGFloat(i) * (tileW + gap), y: pad + 24 + CGFloat(row) * (tileH + gap),
+                               width: tileW, height: tileH)
+                NSColor.labelColor.withAlphaComponent(0.06).setFill()
+                NSBezierPath(roundedRect: r, xRadius: 10, yRadius: 10).fill()
+                text(value, x: r.minX + 14, y: r.minY + 12, size: 28, weight: .semibold, color: .labelColor)
+                var labelX = r.minX + 14
+                if let color {
+                    dot(color, x: labelX, y: r.minY + 59)
+                    labelX += 14
+                }
+                text(label, x: labelX, y: r.minY + 54, size: 12, color: .secondaryLabelColor)
+            }
         }
 
-        // Last 7 days: active time bars with break counts underneath
-        let chartTop = pad + 24 + 84 + 32
+        // Last 7 days: stacked worked/rest/idle bars with break counts underneath
+        let chartTop = pad + 24 + tileH * 2 + gap + 32
         text("Last 7 days", x: pad, y: chartTop, size: 13, weight: .semibold, color: .secondaryLabelColor)
+        var legendX = bounds.width - pad
+        for (_, label, color) in timeStats.reversed() {
+            legendX -= attributed(label, size: 12, weight: .regular, color: .labelColor).size().width
+            text(label, x: legendX, y: chartTop, size: 12, color: .secondaryLabelColor)
+            legendX -= 14
+            dot(color, x: legendX, y: chartTop + 5)
+            legendX -= 16
+        }
+
         let days = (0..<7).reversed().map { Calendar.current.date(byAdding: .day, value: -$0, to: Date())! }
-        let work = days.map { Stats.get(.work, on: $0) }
-        let maxWork = max(work.max() ?? 0, 3600)
+        let values = days.map { day in timeStats.map { Stats.get($0.0, on: day) } }
+        let maxTotal = max(values.map { $0.reduce(0, +) }.max() ?? 0, 3600)
         let plotTop = chartTop + 44, plotBottom = bounds.height - pad - 40
+        let scale = (plotBottom - plotTop) / CGFloat(maxTotal)
         let slot = (bounds.width - pad * 2) / CGFloat(days.count)
         let barW = min(40, slot * 0.5)
         let weekday = DateFormatter()
@@ -674,13 +716,27 @@ final class StatsView: NSView {
         for (i, day) in days.enumerated() {
             let isToday = i == days.count - 1
             let cx = pad + slot * (CGFloat(i) + 0.5)
-            let h = max(2, (plotBottom - plotTop) * CGFloat(work[i]) / CGFloat(maxWork))
-            let bar = NSRect(x: cx - barW / 2, y: plotBottom - h, width: barW, height: h)
-            NSColor.controlAccentColor.withAlphaComponent(isToday ? 1 : 0.45).setFill()
-            NSBezierPath(roundedRect: bar, xRadius: min(4, h / 2), yRadius: min(4, h / 2)).fill()
+            let total = values[i].reduce(0, +)
+            let barH = max(2, CGFloat(total) * scale)
+            let bar = NSRect(x: cx - barW / 2, y: plotBottom - barH, width: barW, height: barH)
 
-            if work[i] > 0 {
-                text(formatDuration(work[i]), centerX: cx, y: bar.minY - 18, size: 11, color: .secondaryLabelColor)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: bar, xRadius: min(4, barH / 2), yRadius: min(4, barH / 2)).addClip()
+            if total == 0 {
+                NSColor.labelColor.withAlphaComponent(0.1).setFill()
+                bar.fill()
+            }
+            var y = plotBottom
+            for (j, (_, _, color)) in timeStats.enumerated() {
+                let h = CGFloat(values[i][j]) * scale
+                color.withAlphaComponent(isToday ? 1 : 0.6).setFill()
+                NSRect(x: bar.minX, y: y - h, width: barW, height: h).fill()
+                y -= h
+            }
+            NSGraphicsContext.restoreGraphicsState()
+
+            if values[i][0] > 0 {
+                text(formatDuration(values[i][0]), centerX: cx, y: bar.minY - 18, size: 11, color: .secondaryLabelColor)
             }
             text(isToday ? "Today" : weekday.string(from: day), centerX: cx, y: plotBottom + 8,
                  size: 12, color: .labelColor)
@@ -688,6 +744,11 @@ final class StatsView: NSView {
             text("\(b) break\(b == 1 ? "" : "s")", centerX: cx, y: plotBottom + 24,
                  size: 11, color: .secondaryLabelColor)
         }
+    }
+
+    private func dot(_ color: NSColor, x: CGFloat, y: CGFloat) {
+        color.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: y, width: 8, height: 8)).fill()
     }
 
     private func attributed(_ s: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSAttributedString {

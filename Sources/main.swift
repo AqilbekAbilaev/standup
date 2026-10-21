@@ -47,7 +47,20 @@ enum Stats {
 
     static func add(_ stat: Stat, _ amount: Int = 1) {
         let k = key(stat, Date())
-        d.set(d.integer(forKey: k) + amount, forKey: k)
+        d.set(max(0, d.integer(forKey: k) + amount), forKey: k)
+    }
+
+    private static func appsKey(_ date: Date) -> String { "apps-" + dayFormat.string(from: date) }
+
+    /// Seconds worked in each app (keyed by bundle ID) on the given day.
+    static func appTimes(on date: Date = Date()) -> [String: Int] {
+        d.dictionary(forKey: appsKey(date)) as? [String: Int] ?? [:]
+    }
+
+    static func addAppTime(_ app: String, _ amount: Int = 1) {
+        var times = appTimes()
+        times[app] = max(0, times[app, default: 0] + amount)
+        d.set(times, forKey: appsKey(Date()))
     }
 }
 
@@ -56,8 +69,22 @@ func systemIdleSeconds() -> TimeInterval {
     CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
 }
 
+/// Identifier for the app in front, used as the key for per-app time.
+func frontmostAppID() -> String? {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+    return app.bundleIdentifier ?? app.localizedName
+}
+
 /// How long without input before the work countdown pauses.
 let idleThreshold: TimeInterval = 2 * 60
+
+/// Apps that are in front while the screen is locked or the screensaver is running.
+let lockScreenApps: Set<String> = ["com.apple.loginwindow", "com.apple.ScreenSaver.Engine"]
+
+/// Away = no input for `idleThreshold`, or the screen is locked.
+func userIsAway(idleSeconds: TimeInterval, app: String?) -> Bool {
+    idleSeconds >= idleThreshold || app.map(lockScreenApps.contains) == true
+}
 
 func formatDuration(_ seconds: Int) -> String {
     let h = seconds / 3600, m = seconds % 3600 / 60
@@ -93,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pausedUntil: Date?
     private var warned = false
     private var wasIdle = false
+    private var lastWorkApp: String?
 
     private var statusItem: NSStatusItem!
     private let overlay = BreakOverlay()
@@ -165,14 +193,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch state {
         case .working:
             let idle = systemIdleSeconds()
-            if idleRemaining == nil && idle >= idleThreshold {
+            let away = userIsAway(idleSeconds: idle, app: frontmostAppID())
+            if idleRemaining == nil && away {
                 // Stepped away: freeze the countdown, giving back the idle time already counted.
                 let credit = min(idle, Date().timeIntervalSince(workStarted))
                 idleRemaining = workEnds.timeIntervalSinceNow + credit
             }
             if let frozen = idleRemaining {
                 workEnds = Date().addingTimeInterval(frozen)
-                if idle >= idleThreshold { break }
+                if away { break }
                 idleRemaining = nil // back at the keyboard: resume from where it stopped
             }
             let left = workEnds.timeIntervalSinceNow
@@ -196,14 +225,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Stats.add(.rest)
             return
         }
-        let idle = systemIdleSeconds() >= idleThreshold
+        let idleSeconds = systemIdleSeconds()
+        let app = frontmostAppID()
+        let idle = userIsAway(idleSeconds: idleSeconds, app: app)
         if idle && !wasIdle {
-            // The threshold's worth of seconds before idle was noticed were counted as work.
-            Stats.add(.work, -Int(idleThreshold))
-            Stats.add(.idle, Int(idleThreshold))
+            // Seconds without input before we noticed were counted as work; move them to idle.
+            let backfill = Int(min(idleSeconds, idleThreshold))
+            Stats.add(.work, -backfill)
+            Stats.add(.idle, backfill)
+            if let lastWorkApp { Stats.addAppTime(lastWorkApp, -backfill) }
         }
         wasIdle = idle
         Stats.add(idle ? .idle : .work)
+        if !idle, let app {
+            Stats.addAppTime(app)
+            lastWorkApp = app
+        }
     }
 
     private func updateTitle() {
@@ -632,7 +669,7 @@ final class StatsWindow {
 
     func show() {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 780),
                              styleMask: [.titled, .closable, .miniaturizable],
                              backing: .buffered, defer: false)
             w.title = "StandUp Statistics"
@@ -691,8 +728,30 @@ final class StatsView: NSView {
             }
         }
 
+        // Today's top apps by worked time
+        let appsTop = pad + 24 + tileH * 2 + gap + 32
+        text("Apps today", x: pad, y: appsTop, size: 13, weight: .semibold, color: .secondaryLabelColor)
+        let apps = Stats.appTimes().filter { $0.value >= 60 }.sorted { $0.value > $1.value }.prefix(appRows)
+        if apps.isEmpty {
+            text("Nothing yet — apps you use for a minute or more show up here.",
+                 x: pad, y: appsTop + 28, size: 12, color: .tertiaryLabelColor)
+        }
+        let topSeconds = apps.first?.value ?? 1
+        let barX = pad + 190, barMaxW = bounds.width - pad - 70 - barX
+        for (i, (id, seconds)) in apps.enumerated() {
+            let y = appsTop + 28 + CGFloat(i) * appRowH
+            let (name, icon) = appInfo(id)
+            icon?.draw(in: NSRect(x: pad, y: y, width: 18, height: 18), from: .zero, operation: .sourceOver,
+                       fraction: 1, respectFlipped: true, hints: nil)
+            text(name, x: pad + 26, y: y + 1, size: 13, color: .labelColor)
+            let w = max(2, barMaxW * CGFloat(seconds) / CGFloat(topSeconds))
+            NSColor.controlAccentColor.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: NSRect(x: barX, y: y + 4, width: w, height: 10), xRadius: 3, yRadius: 3).fill()
+            text(formatDuration(seconds), rightX: bounds.width - pad, y: y + 1, size: 12, color: .secondaryLabelColor)
+        }
+
         // Last 7 days: stacked worked/rest/idle bars with break counts underneath
-        let chartTop = pad + 24 + tileH * 2 + gap + 32
+        let chartTop = appsTop + 28 + CGFloat(appRows) * appRowH + 16
         text("Last 7 days", x: pad, y: chartTop, size: 13, weight: .semibold, color: .secondaryLabelColor)
         var legendX = bounds.width - pad
         for (_, label, color) in timeStats.reversed() {
@@ -746,6 +805,23 @@ final class StatsView: NSView {
         }
     }
 
+    private let appRows = 6
+    private let appRowH: CGFloat = 28
+    private var appInfoCache: [String: (String, NSImage?)] = [:]
+
+    /// Display name and icon for a bundle ID (falls back to the ID itself).
+    private func appInfo(_ id: String) -> (String, NSImage?) {
+        if let cached = appInfoCache[id] { return cached }
+        var info: (String, NSImage?) = (id, nil)
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+            var name = FileManager.default.displayName(atPath: url.path)
+            if name.hasSuffix(".app") { name = String(name.dropLast(4)) }
+            info = (name, NSWorkspace.shared.icon(forFile: url.path))
+        }
+        appInfoCache[id] = info
+        return info
+    }
+
     private func dot(_ color: NSColor, x: CGFloat, y: CGFloat) {
         color.setFill()
         NSBezierPath(ovalIn: NSRect(x: x, y: y, width: 8, height: 8)).fill()
@@ -761,6 +837,12 @@ final class StatsView: NSView {
     private func text(_ s: String, x: CGFloat, y: CGFloat, size: CGFloat,
                       weight: NSFont.Weight = .regular, color: NSColor) {
         attributed(s, size: size, weight: weight, color: color).draw(at: NSPoint(x: x, y: y))
+    }
+
+    private func text(_ s: String, rightX: CGFloat, y: CGFloat, size: CGFloat,
+                      weight: NSFont.Weight = .regular, color: NSColor) {
+        let a = attributed(s, size: size, weight: weight, color: color)
+        a.draw(at: NSPoint(x: rightX - a.size().width, y: y))
     }
 
     private func text(_ s: String, centerX: CGFloat, y: CGFloat, size: CGFloat,
